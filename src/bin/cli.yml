@@ -1,0 +1,31 @@
+name: kvscli
+version: "0.1.0"
+auther: Darren <qiwei9743@gmail.com>
+about: command line for kvs.
+subcommands:
+  - get:
+      about: get get of the key
+      args:
+        - KEY:
+            help: key to get value
+            required: true
+            index: 1
+  - set:
+      about: set a key/value pairs
+      args:
+        - KEY:
+            help: key to set
+            required: true
+            index: 1
+        - VALUE:
+            help: value to set
+            required: true
+            index: 2
+  - rm:
+      about: remove a key
+      args:
+        - KEY:
+            help: key to remove
+            required: true
+            index: 1
+      
