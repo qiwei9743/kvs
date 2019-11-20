@@ -59,7 +59,7 @@ type Result<T> = std::result::Result<T, error::KvsError>;
 
 impl KvStore {
     /// create a new object for KvStore within a given directory.
-    pub fn new_from<P: AsRef<Path>>(mut p: P) -> Result<Self> {
+    pub fn new_from<P: AsRef<Path>>(p: P) -> Result<Self> {
         Ok(
             Self {
                 wal: OpenOptions::new().read(true).write(true).create(true)
@@ -85,23 +85,24 @@ impl KvStore {
     pub fn from_wal<P: AsRef<Path>>(p: P) -> Result<Self> {
         let wal_path = p.as_ref().join("wal.log");
         println!("from_wal {:?}", wal_path);
-        let mut wal = OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
+        let wal = OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
+        let mut reader = BufReader::new(&wal);
         let mut location_finder = HashMap::new();
         let meta = std::fs::metadata(&wal_path)?;
         let wal_size = meta.len();
         let mut latest_seq = 0;
 
         loop {
-            let offset = wal.seek(SeekFrom::Current(0))?;
+            let offset = reader.seek(SeekFrom::Current(0))?;
             if offset == wal_size {
                 break
             }
 
             let mut bs = [0u8; 4];
-            wal.read(&mut bs)?;
+            reader.read_exact(&mut bs)?;
             let bytes_count = u32::from_be_bytes(bs);
             let mut buff = vec![0u8; bytes_count as usize];
-            wal.read_exact(&mut buff)?;
+            reader.read_exact(&mut buff)?;
 
             let cmd: OnDiskCommand = serde_json::from_slice(&buff)?;
             match cmd.value {
@@ -153,7 +154,7 @@ impl KvStore {
         self.latest_seq += 1;
         let cmd = OnDiskCommand{
             sequence: self.latest_seq,
-            key: key,
+            key,
             value: OnDiskValue::Content(value)};
 
         let offset = self.append_wal(&cmd)?;
@@ -163,7 +164,7 @@ impl KvStore {
 
     /// remove a key/value pairs by a given key.
     pub fn remove(&mut self, key: String) -> Result<()> {
-        if let Some(_) = self.location_finder.get(&key) {
+        if self.location_finder.get(&key).is_some() {
             self.latest_seq += 1;
 
             let cmd = OnDiskCommand{
@@ -185,8 +186,8 @@ impl KvStore {
         let data = serde_json::to_vec(cmd)?;
         let data_len = data.len() as u32;
         let data_len_bytes = data_len.to_be_bytes();
-        writer.write(&data_len_bytes)?;
-        writer.write(&data)?;
+        writer.write_all(&data_len_bytes)?;
+        writer.write_all(&data)?;
         writer.flush()?;
         Ok(offset)
     }
@@ -195,7 +196,7 @@ impl KvStore {
         let mut reader = BufReader::new(&self.wal);
         reader.seek(SeekFrom::Start(offset))?;
         let mut count_bytes = [0u8; 4];
-        reader.read(&mut count_bytes)?;
+        reader.read_exact(&mut count_bytes)?;
         let data_bytes_count = u32::from_be_bytes(count_bytes);
         let mut buf = vec![0u8; data_bytes_count as usize];
         reader.read_exact(&mut buf)?;
