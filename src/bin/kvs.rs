@@ -1,22 +1,30 @@
-#[macro_use]
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
-#[structopt(about = "kvscli 0.1.0")]
+#[structopt(about = "about kvscli")]
+/// The help message
 enum KvsCliOpt {
+    /// Get the value of a given key.
     Get {
         #[structopt()]
-        key: Option<String>,
+        /// The key to get value
+        key: String,
     },
+    /// Set key/value pairs
     Set {
         #[structopt()]
-        key: Option<String>,
+        /// The key in k/v pairs
+        key: String,
+
         #[structopt()]
-        value: Option<String>,
+        /// The value in k/v pairs
+        value: String,
     },
+    /// Remove a key from kv Store
     Rm {
         #[structopt()]
-        key: Option<String>
+        /// The key to remove from kv Store
+        key: String
     }
 }
 
