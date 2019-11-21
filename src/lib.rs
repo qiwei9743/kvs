@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 
 mod error;
+use error::Result;
+
+mod wal;
 
 #[derive(Serialize, Deserialize, Debug)]
 enum Value {
@@ -30,13 +33,19 @@ struct Command {
     value: Value,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 enum OnDiskValue {
     Deleted,
     Content(String),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+enum OnDiskIndex {
+    ValueIndex { key: String, fid: u8, offset: u32},
+    FreeIndex { fid: u8, start: u32, length: u32},
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct OnDiskCommand {
     sequence: u64,
     key: String,
@@ -55,8 +64,6 @@ pub struct KvStore {
     location_finder: HashMap<String, Value>
 }
 
-type Result<T> = std::result::Result<T, error::KvsError>;
-
 impl KvStore {
     /// create a new object for KvStore within a given directory.
     pub fn new_from<P: AsRef<Path>>(p: P) -> Result<Self> {
@@ -73,9 +80,9 @@ impl KvStore {
     /// create a new object for KvStore with wal.log
     pub fn new() -> Self {
         Self {
-            //wal: File::create("wal.log").unwrap(),
-            wal: OpenOptions::new().read(true).write(true).create(true)
-                .open("wal.log").unwrap(),
+            wal: File::create("wal.log").unwrap(),
+            //wal: OpenOptions::new().read(true).write(true).create(true)
+            //    .open("wal.log").unwrap(),
             latest_seq: 0,
             location_finder: HashMap::new(),
         }
@@ -115,6 +122,22 @@ impl KvStore {
             };
             latest_seq = cmd.sequence;
         }
+
+        // // start
+        // let max_seq_index = meta_wal.max_seq();
+        // let max_seq_data = meta_wal.max_seq();
+        // if max_seq_index > max_seq_data {
+        //     // recover from index until max_seq_data
+        //     // and truncate *index* after @max_seq_data.
+        //     // This is is not expected to occur which may result in consistent
+        //     // in client side. It's better to sync data wal before sync index.
+        //     // assert False
+        // } else if max_seq_index < max_seq_data {
+        //     // recover from index until max_seq_index.
+        //     // then rebuild index log with data between max_seq_index and max_seq_data.
+        // }
+        // let location_finder = meta_wal.iter().collect<HashMap<_>>();
+        
 
         Ok(
             Self {
@@ -158,6 +181,8 @@ impl KvStore {
             value: OnDiskValue::Content(value)};
 
         let offset = self.append_wal(&cmd)?;
+        // let offset = self.data_wal.append(&cmd)?;
+        // self.meta_wal.append(key_meta)?; // need sync point
         self.location_finder.insert(cmd.key, Value::Location(offset));
         Ok(())
     }
@@ -211,7 +236,8 @@ mod tests {
     use super::*;
     #[test]
     fn test_set_two_key() {
-        let mut kvs = KvStore::new_from(tempfile::tempdir().unwrap()).unwrap();
+        //let mut kvs = KvStore::new_from(tempfile::tempdir().unwrap()).unwrap();
+        let mut kvs = KvStore::new();
         kvs.set("key1".into(), "value2".into()).unwrap();
         kvs.set("key2".into(), "value2".into()).unwrap();
     }

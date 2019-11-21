@@ -26,3 +26,6 @@ impl From<std::string::FromUtf8Error> for KvsError {
         KvsError::FromUtf8Error(err)
     }
 }
+
+
+pub type Result<T> = std::result::Result<T, KvsError>;
