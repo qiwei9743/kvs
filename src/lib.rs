@@ -3,17 +3,14 @@
 //! This project is only for pingcap project.
 //! Have fun.
 
-use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::prelude::*;
-use std::io::SeekFrom;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
 use std::convert::AsRef;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json;
 
 mod error;
 use error::Result;
@@ -60,7 +57,7 @@ struct HintBlock {
 
 /// core data structure for kvs store
 pub struct KvStore {
-    wal_log: wal::WalLog<OnDiskCommand, File>,
+    wal_log: wal::WalLog<OnDiskCommand>,
     latest_seq: u64,
     location_finder: HashMap<String, Value>
 }
@@ -70,9 +67,9 @@ impl KvStore {
     pub fn new_from<P: AsRef<Path>>(p: P) -> Result<Self> {
         Ok(
             Self {
-                wal_log: wal::WalLog::<OnDiskCommand, File>::new(
+                wal_log: wal::WalLog::<OnDiskCommand>::new(
                     OpenOptions::new().read(true).write(true).create(true)
-                        .open(p.as_ref().join("wal.log"))?, 0),
+                        .open(p.as_ref().join("wal.log"))?),
                 latest_seq: 0,
                 location_finder: HashMap::new(),
             }
@@ -83,12 +80,12 @@ impl KvStore {
     pub fn new() -> Result<Self> {
         Ok(
             Self {
-                wal_log: wal::WalLog::<OnDiskCommand, File>::new(
+                wal_log: wal::WalLog::<OnDiskCommand>::new(
                     OpenOptions::new()
                         .read(true)
                         .write(true)
                         .create(true)
-                        .open("data.wal")?, 0),
+                        .open("data.wal")?),
                 latest_seq: 0,
                 location_finder: HashMap::new(),
             }
@@ -100,15 +97,12 @@ impl KvStore {
         let wal_path = p.as_ref().join("wal.log");
         println!("from_wal {:?}", wal_path);
         let wal_fd = OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
-        let mut wal_log = wal::WalLog::<OnDiskCommand, File>::new(wal_fd, 0);
-
-        // let mut reader = BufReader::new(&wal);
+        let mut wal_reader = BufReader::new(&wal_fd);
         let mut location_finder = HashMap::new();
-        //let meta = std::fs::metadata(&wal_path)?;
-        //let wal_size = meta.len();
-        let mut latest_seq = 0;
 
-        for (offset, OnDiskCommand{sequence, key, value}) in wal_log.iter() {
+        for (offset, OnDiskCommand{sequence, key, value}) in
+            wal::WalLog::<OnDiskCommand>::iter(&mut wal_reader) {
+
             match value {
                 OnDiskValue::Content(_) => {
                     location_finder.entry(key)
@@ -118,7 +112,6 @@ impl KvStore {
                             }
                         })
                         .or_insert((sequence, Value::Location(offset)));
-
                     // location_finder.insert(
                     //     cmd.key, (cmd.sequence, Value::Location(offset)));
                 },
@@ -133,50 +126,17 @@ impl KvStore {
                 }
             };
         }
-        let latest_seq = location_finder.iter().map(|(k, v)| v.0 ).max().unwrap_or(0);
-        let location_finder = location_finder.into_iter().map(|(k, v)|{
+        let latest_seq = location_finder.iter().map(|(_k, v)| v.0 ).max().unwrap_or(0);
+        let location_finder = location_finder.into_iter().filter(|(_k, v)| {
+            match v.1 {
+                Value::Location(_) => true ,
+                _ => false
+            }
+        }).map(|(k, v)|{
             (k, v.1)
         }).collect();
 
-        // loop {
-        //     let offset = reader.seek(SeekFrom::Current(0))?;
-        //     if offset == wal_size {
-        //         break
-        //     }
-
-        //     let mut bs = [0u8; 4];
-        //     reader.read_exact(&mut bs)?;
-        //     let bytes_count = u32::from_be_bytes(bs);
-        //     let mut buff = vec![0u8; bytes_count as usize];
-        //     reader.read_exact(&mut buff)?;
-
-        //     let cmd: OnDiskCommand = serde_json::from_slice(&buff)?;
-        //     match cmd.value {
-        //         OnDiskValue::Content(_) => {
-        //             location_finder.insert(cmd.key, Value::Location(offset));
-        //         },
-        //         OnDiskValue::Deleted => {
-        //             location_finder.remove(&cmd.key);
-        //         }
-        //     };
-        //     latest_seq = cmd.sequence;
-        // }
-
-        // // start
-        // let max_seq_index = meta_wal.max_seq();
-        // let max_seq_data = meta_wal.max_seq();
-        // if max_seq_index > max_seq_data {
-        //     // recover from index until max_seq_data
-        //     // and truncate *index* after @max_seq_data.
-        //     // This is is not expected to occur which may result in consistent
-        //     // in client side. It's better to sync data wal before sync index.
-        //     // assert False
-        // } else if max_seq_index < max_seq_data {
-        //     // recover from index until max_seq_index.
-        //     // then rebuild index log with data between max_seq_index and max_seq_data.
-        // }
-        // let location_finder = meta_wal.iter().collect<HashMap<_>>();
-
+        let wal_log = wal::WalLog::<OnDiskCommand>::new(wal_fd);
         Ok(
             Self {
                 wal_log,
@@ -247,12 +207,16 @@ impl KvStore {
     }
 
     fn append_wal(&mut self, cmd: &OnDiskCommand) -> Result<u64> {
-        Ok(self.wal_log.append(cmd)?)
+        let mut writer = BufWriter::new(&self.wal_log.fd);
+        let offset = self.wal_log.append(&mut writer, cmd)?;
+        writer.flush()?;
+        Ok(offset)
     }
 
     // FIXME: get rid of &mut since it's a read operation.
-    fn read_wal(&mut self, offset: u64) -> Result<OnDiskCommand> {
-        Ok(self.wal_log.read(offset)?)
+    fn read_wal(&self, offset: u64) -> Result<OnDiskCommand> {
+        let mut reader = BufReader::new(&self.wal_log.fd);
+        Ok(self.wal_log.read(&mut reader, offset)?)
     }
 }
 
