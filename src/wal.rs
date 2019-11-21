@@ -8,9 +8,8 @@ use crate::error::Result;
 
 /// flush in background when buffer nearly full
 /// and continue writing in a another buffer.
-struct WalLog<T, S>
+pub struct WalLog<T, S>
 where T: Serialize+DeserializeOwned, S: Seek+Read+Write {
-
     stor: S,
     latest_seq: u64,
     _t: PhantomData<T>,
@@ -18,17 +17,27 @@ where T: Serialize+DeserializeOwned, S: Seek+Read+Write {
 
 impl<T,S> WalLog<T,S>
 where T: Serialize+DeserializeOwned, S: Seek+Read+Write {
-
-    pub fn new() -> Self {
-        unimplemented!()
+    pub fn new(s: S, latest_seq: u64) -> Self {
+        Self {
+            stor: s,
+            latest_seq: 0,
+            _t: PhantomData{},
+        }
     }
 
-    pub fn append(&self, cmd: &T) -> Result<u64> {
-        unimplemented!()
+    pub fn append(&mut self, cmd: &T) -> Result<u64> {
+        let offset = self.stor.seek(SeekFrom::End(0))?;
+        write_wal_entry(&mut self.stor, cmd)?;
+        Ok(offset)
     }
 
-    pub fn read(&self, offset: u64) -> Result<T> {
-        unimplemented!()
+    pub fn read(&mut self, offset: u64) -> Result<T> {
+        self.stor.seek(SeekFrom::Start(offset))?;
+        Ok(read_wal_entry(&mut self.stor)?)
+    }
+
+    pub fn iter(&mut self) -> WalIterator<T, S> {
+        WalIterator::new(&mut self.stor).unwrap()
     }
 
     pub fn truncate<Idx>(&mut self, rang: Range<Idx>) -> Result<()> {
@@ -49,12 +58,13 @@ struct OnDiskIndex {
     loc: Location,
 }
 
-struct WalIterator<'a, T> where T: DeserializeOwned {
-    reader: BufReader<&'a File>,
+pub struct WalIterator<'a, T, S> where T: DeserializeOwned, S: Read+Seek {
+    reader: &'a mut S,
     _t: PhantomData<T>,
 }
 
-impl<'a, T> Iterator for WalIterator<'a, T> where T: DeserializeOwned {
+impl<'a, T, S> Iterator for WalIterator<'a, T, S>
+where T: DeserializeOwned, S: Read+Seek {
     type Item = (u64, T);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -62,23 +72,35 @@ impl<'a, T> Iterator for WalIterator<'a, T> where T: DeserializeOwned {
     }
 }
 
-impl<'a, T> WalIterator<'a, T> where T: DeserializeOwned {
-    fn new(fd: &'a File) -> Result<Self> {
-        let mut reader = BufReader::new(fd);
+impl<'a, T, S> WalIterator<'a, T, S>
+where T: DeserializeOwned, S:Seek+Read {
+    fn new(reader: &'a mut S) -> Result<Self> {
+        // let mut reader = BufReader::new(s);
         reader.seek(SeekFrom::Start(0))?;
         Ok(
             Self { reader, _t: PhantomData{} }
         )
     }
-    fn _next(&mut self) -> Result<(<WalIterator<'a, T> as Iterator>::Item)> {
+    fn _next(&mut self) -> Result<(<WalIterator<'a, T, S> as Iterator>::Item)> {
         Ok(
             (self.reader.seek(SeekFrom::Current(0))?,
-             read_wal_entry(&mut self.reader)?)
+             read_wal_entry(self.reader)?)
         )
     }
 }
 
-fn read_wal_entry<T>(mut reader: impl Read) -> Result<T>
+fn write_wal_entry<T>(mut writer: impl Write, data: T) -> Result<()>
+where T: Serialize {
+    let data = serde_json::to_vec(&data)?;
+    let data_len = data.len() as u32;
+    let data_len_bytes = data_len.to_be_bytes();
+    writer.write_all(&data_len_bytes)?;
+    writer.write_all(&data)?;
+    //writer.flush()?;
+    Ok(())
+}
+
+fn read_wal_entry<T>(mut reader: &mut impl Read) -> Result<T>
 where T: DeserializeOwned {
     //let offset = self.reader.seek(SeekFrom::Current(0))?;
     let mut count_bytes = [0u8; 4];
@@ -107,7 +129,7 @@ mod tests {
         std::mem::drop(kvs);
 
         let mut fd = File::open(tmpdir.into_path().join("wal.log")).unwrap();
-        let mut wi: WalIterator<OnDiskCommand> = WalIterator::new(&fd).unwrap();
+        let mut wi: WalIterator<OnDiskCommand, File> = WalIterator::new(&mut fd).unwrap();
         let kvvec:Vec<_> = wi.collect();
         for (idx, (_, cmd)) in kvvec.iter().enumerate() {
             let key = format!("key{}", idx);

@@ -24,6 +24,7 @@ mod wal;
 enum Value {
     Location(u64),
     Content(String),
+    Deleted,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -59,7 +60,7 @@ struct HintBlock {
 
 /// core data structure for kvs store
 pub struct KvStore {
-    wal: File,
+    wal_log: wal::WalLog<OnDiskCommand, File>,
     latest_seq: u64,
     location_finder: HashMap<String, Value>
 }
@@ -69,8 +70,9 @@ impl KvStore {
     pub fn new_from<P: AsRef<Path>>(p: P) -> Result<Self> {
         Ok(
             Self {
-                wal: OpenOptions::new().read(true).write(true).create(true)
-                    .open(p.as_ref().join("wal.log")).unwrap(),
+                wal_log: wal::WalLog::<OnDiskCommand, File>::new(
+                    OpenOptions::new().read(true).write(true).create(true)
+                        .open(p.as_ref().join("wal.log"))?, 0),
                 latest_seq: 0,
                 location_finder: HashMap::new(),
             }
@@ -78,50 +80,87 @@ impl KvStore {
     }
 
     /// create a new object for KvStore with wal.log
-    pub fn new() -> Self {
-        Self {
-            wal: File::create("wal.log").unwrap(),
-            //wal: OpenOptions::new().read(true).write(true).create(true)
-            //    .open("wal.log").unwrap(),
-            latest_seq: 0,
-            location_finder: HashMap::new(),
-        }
+    pub fn new() -> Result<Self> {
+        Ok(
+            Self {
+                wal_log: wal::WalLog::<OnDiskCommand, File>::new(
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .open("data.wal")?, 0),
+                latest_seq: 0,
+                location_finder: HashMap::new(),
+            }
+        )
     }
 
     /// recover from a wal log.
     pub fn from_wal<P: AsRef<Path>>(p: P) -> Result<Self> {
         let wal_path = p.as_ref().join("wal.log");
         println!("from_wal {:?}", wal_path);
-        let wal = OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
-        let mut reader = BufReader::new(&wal);
+        let wal_fd = OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
+        let mut wal_log = wal::WalLog::<OnDiskCommand, File>::new(wal_fd, 0);
+
+        // let mut reader = BufReader::new(&wal);
         let mut location_finder = HashMap::new();
-        let meta = std::fs::metadata(&wal_path)?;
-        let wal_size = meta.len();
+        //let meta = std::fs::metadata(&wal_path)?;
+        //let wal_size = meta.len();
         let mut latest_seq = 0;
 
-        loop {
-            let offset = reader.seek(SeekFrom::Current(0))?;
-            if offset == wal_size {
-                break
-            }
-
-            let mut bs = [0u8; 4];
-            reader.read_exact(&mut bs)?;
-            let bytes_count = u32::from_be_bytes(bs);
-            let mut buff = vec![0u8; bytes_count as usize];
-            reader.read_exact(&mut buff)?;
-
-            let cmd: OnDiskCommand = serde_json::from_slice(&buff)?;
-            match cmd.value {
+        for (offset, OnDiskCommand{sequence, key, value}) in wal_log.iter() {
+            match value {
                 OnDiskValue::Content(_) => {
-                    location_finder.insert(cmd.key, Value::Location(offset));
+                    location_finder.entry(key)
+                        .and_modify(|e: &mut (u64, Value)| {
+                            if e.0 < sequence {
+                                *e = (sequence, Value::Location(offset));
+                            }
+                        })
+                        .or_insert((sequence, Value::Location(offset)));
+
+                    // location_finder.insert(
+                    //     cmd.key, (cmd.sequence, Value::Location(offset)));
                 },
                 OnDiskValue::Deleted => {
-                    location_finder.remove(&cmd.key);
+                    location_finder.entry(key)
+                        .and_modify(|e| {
+                            if e.0 < sequence {
+                                *e = (sequence, Value::Deleted)
+                            }
+                        })
+                        .or_insert((sequence, Value::Deleted));
                 }
             };
-            latest_seq = cmd.sequence;
         }
+        let latest_seq = location_finder.iter().map(|(k, v)| v.0 ).max().unwrap_or(0);
+        let location_finder = location_finder.into_iter().map(|(k, v)|{
+            (k, v.1)
+        }).collect();
+
+        // loop {
+        //     let offset = reader.seek(SeekFrom::Current(0))?;
+        //     if offset == wal_size {
+        //         break
+        //     }
+
+        //     let mut bs = [0u8; 4];
+        //     reader.read_exact(&mut bs)?;
+        //     let bytes_count = u32::from_be_bytes(bs);
+        //     let mut buff = vec![0u8; bytes_count as usize];
+        //     reader.read_exact(&mut buff)?;
+
+        //     let cmd: OnDiskCommand = serde_json::from_slice(&buff)?;
+        //     match cmd.value {
+        //         OnDiskValue::Content(_) => {
+        //             location_finder.insert(cmd.key, Value::Location(offset));
+        //         },
+        //         OnDiskValue::Deleted => {
+        //             location_finder.remove(&cmd.key);
+        //         }
+        //     };
+        //     latest_seq = cmd.sequence;
+        // }
 
         // // start
         // let max_seq_index = meta_wal.max_seq();
@@ -137,11 +176,10 @@ impl KvStore {
         //     // then rebuild index log with data between max_seq_index and max_seq_data.
         // }
         // let location_finder = meta_wal.iter().collect<HashMap<_>>();
-        
 
         Ok(
             Self {
-                wal,
+                wal_log,
                 latest_seq,
                 location_finder,
             }
@@ -149,7 +187,7 @@ impl KvStore {
     }
 
     /// get a value with a given key.
-    pub fn get(&self, key: String) -> Result<Option<String>> {
+    pub fn get(&mut self, key: String) -> Result<Option<String>> {
         if let Some(value) = self.location_finder.get(&key) {
             match value {
                 Value::Location(offset) => {
@@ -166,6 +204,9 @@ impl KvStore {
                 Value::Content(content) => {
                     Ok(Some(content.clone()))
                 },
+                Value::Deleted => {
+                    Ok(None)
+                }
             }
         } else {
             Ok(None)
@@ -206,27 +247,12 @@ impl KvStore {
     }
 
     fn append_wal(&mut self, cmd: &OnDiskCommand) -> Result<u64> {
-        let mut writer = BufWriter::new(&mut self.wal);
-        let offset = writer.seek(SeekFrom::End(0))?;
-        let data = serde_json::to_vec(cmd)?;
-        let data_len = data.len() as u32;
-        let data_len_bytes = data_len.to_be_bytes();
-        writer.write_all(&data_len_bytes)?;
-        writer.write_all(&data)?;
-        writer.flush()?;
-        Ok(offset)
+        Ok(self.wal_log.append(cmd)?)
     }
 
-    fn read_wal(&self, offset: u64) -> Result<OnDiskCommand> {
-        let mut reader = BufReader::new(&self.wal);
-        reader.seek(SeekFrom::Start(offset))?;
-        let mut count_bytes = [0u8; 4];
-        reader.read_exact(&mut count_bytes)?;
-        let data_bytes_count = u32::from_be_bytes(count_bytes);
-        let mut buf = vec![0u8; data_bytes_count as usize];
-        reader.read_exact(&mut buf)?;
-        let cmd = serde_json::from_slice(&buf)?;
-        Ok(cmd)
+    // FIXME: get rid of &mut since it's a read operation.
+    fn read_wal(&mut self, offset: u64) -> Result<OnDiskCommand> {
+        Ok(self.wal_log.read(offset)?)
     }
 }
 
@@ -237,7 +263,7 @@ mod tests {
     #[test]
     fn test_set_two_key() {
         //let mut kvs = KvStore::new_from(tempfile::tempdir().unwrap()).unwrap();
-        let mut kvs = KvStore::new();
+        let mut kvs = KvStore::new().unwrap();
         kvs.set("key1".into(), "value2".into()).unwrap();
         kvs.set("key2".into(), "value2".into()).unwrap();
     }
