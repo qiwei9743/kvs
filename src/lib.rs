@@ -4,6 +4,7 @@
 //! Have fun.
 
 use std::fs::OpenOptions;
+use std::fs::File;
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
@@ -32,8 +33,14 @@ struct Command {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+enum OnDiskMeta {
+    LogPointer {key: String, value: OnDiskValue}
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 enum OnDiskValue {
     Deleted,
+    Pointer{fid: u16, offset: u64},
     Content(String),
 }
 
@@ -57,19 +64,25 @@ struct HintBlock {
 
 /// core data structure for kvs store
 pub struct KvStore {
-    wal_log: wal::WalLog<OnDiskCommand>,
+    wal_cmd: wal::WalLog<OnDiskCommand>,
+    wal_meta: wal::WalLog<OnDiskMeta>,
+
     latest_seq: u64,
     location_finder: HashMap<String, Value>
 }
 
-impl KvStore {
+impl<'a> KvStore {
     /// create a new object for KvStore within a given directory.
     pub fn new_from<P: AsRef<Path>>(p: P) -> Result<Self> {
+        let meta_fd = OpenOptions::new().read(true).write(true).create(true)
+            .open(p.as_ref().join("meta.wal"))?;
+        //let wal_meta = BufWriter::new(meta_fd);
         Ok(
             Self {
-                wal_log: wal::WalLog::<OnDiskCommand>::new(
+                wal_cmd: wal::WalLog::<OnDiskCommand>::new(
                     OpenOptions::new().read(true).write(true).create(true)
-                        .open(p.as_ref().join("wal.log"))?),
+                        .open(p.as_ref().join("cmd.wal"))?),
+                wal_meta: wal::WalLog::<OnDiskMeta>::new(meta_fd),
                 latest_seq: 0,
                 location_finder: HashMap::new(),
             }
@@ -78,14 +91,21 @@ impl KvStore {
 
     /// create a new object for KvStore with wal.log
     pub fn new() -> Result<Self> {
+        let meta_fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open("meta.wal")?;
+        //let bufwriter_meta = BufWriter::new(&meta_fd);
         Ok(
             Self {
-                wal_log: wal::WalLog::<OnDiskCommand>::new(
+                wal_cmd: wal::WalLog::<OnDiskCommand>::new(
                     OpenOptions::new()
                         .read(true)
                         .write(true)
                         .create(true)
-                        .open("data.wal")?),
+                        .open("cmd.wal")?),
+                wal_meta: wal::WalLog::<OnDiskMeta>::new(meta_fd),
                 latest_seq: 0,
                 location_finder: HashMap::new(),
             }
@@ -94,14 +114,21 @@ impl KvStore {
 
     /// recover from a wal log.
     pub fn from_wal<P: AsRef<Path>>(p: P) -> Result<Self> {
-        let wal_path = p.as_ref().join("wal.log");
-        println!("from_wal {:?}", wal_path);
-        let wal_fd = OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
-        let mut wal_reader = BufReader::new(&wal_fd);
+        let wal_cmd_path = p.as_ref().join("cmd.wal");
+        let wal_meta_path = p.as_ref().join("meta.wal");
+
+        let wal_cmd_fd = OpenOptions::new().read(true).write(true).open(&wal_cmd_path)?;
+        let wal_meta_fd = OpenOptions::new().read(true).write(true).open(&wal_meta_path)?;
+
+        let mut wal_cmd_reader = BufReader::new(&wal_cmd_fd);
+        //let mut wal_meta_reader = BufReader::new(&wal_meta_fd);
+
         let mut location_finder = HashMap::new();
 
+        //Self::recover_index();
+
         for (offset, OnDiskCommand{sequence, key, value}) in
-            wal::WalLog::<OnDiskCommand>::iter(&mut wal_reader) {
+            wal::WalLog::<OnDiskCommand>::iter(&mut wal_cmd_reader) {
 
             match value {
                 OnDiskValue::Content(_) => {
@@ -123,6 +150,9 @@ impl KvStore {
                             }
                         })
                         .or_insert((sequence, Value::Deleted));
+                },
+                OnDiskValue::Pointer{fid:_, offset:_} => {
+                    return Err(error::KvsError::FoundPointerFromDataWal);
                 }
             };
         }
@@ -136,28 +166,40 @@ impl KvStore {
             (k, v.1)
         }).collect();
 
-        let wal_log = wal::WalLog::<OnDiskCommand>::new(wal_fd);
+        //let bufwriter_meta = BufWriter::new(&wal_meta_fd);
+        let wal_cmd = wal::WalLog::<OnDiskCommand>::new(wal_cmd_fd);
+        let wal_meta = wal::WalLog::<OnDiskMeta>::new(wal_meta_fd);
         Ok(
             Self {
-                wal_log,
+                wal_cmd,
+                wal_meta,
                 latest_seq,
                 location_finder,
             }
         )
     }
 
+    // fn recover_index(meta_reader: impl Reader+Seek) -> Result<()> {
+
+    //     unimplemented!()
+    // }
+
     /// get a value with a given key.
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
         if let Some(value) = self.location_finder.get(&key) {
             match value {
                 Value::Location(offset) => {
-                    let od_cmd = self.read_wal(*offset)?;
+                    let od_cmd = self.read_cmd_wal(*offset)?;
                     match od_cmd.value {
                         OnDiskValue::Content(content) => {
                             Ok(Some(content))
                         },
                         OnDiskValue::Deleted => {
                             Ok(None)
+                        }
+                        OnDiskValue::Pointer{fid: _, offset: _} => {
+                            // should NOT find a pointer from cmd.wal file
+                            Err(error::KvsError::FoundPointerFromDataWal)
                         }
                     }
                 },
@@ -176,12 +218,19 @@ impl KvStore {
     /// set a key/value pairs
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
         self.latest_seq += 1;
-        let cmd = OnDiskCommand{
+        let cmd = OnDiskCommand {
             sequence: self.latest_seq,
-            key,
-            value: OnDiskValue::Content(value)};
+            key: key.clone(),
+            value: OnDiskValue::Content(value)
+        };
 
-        let offset = self.append_wal(&cmd)?;
+        let offset = self.append_cmd_wal(&cmd)?;
+
+        let pl = OnDiskMeta::LogPointer{
+            key,
+            value: OnDiskValue::Pointer{fid: 0, offset},
+        };
+
         // let offset = self.data_wal.append(&cmd)?;
         // self.meta_wal.append(key_meta)?; // need sync point
         self.location_finder.insert(cmd.key, Value::Location(offset));
@@ -198,7 +247,7 @@ impl KvStore {
                 key,
                 value: OnDiskValue::Deleted,
             };
-            self.append_wal(&cmd)?;
+            self.append_cmd_wal(&cmd)?;
             self.location_finder.remove(&cmd.key);
             Ok(())
         } else {
@@ -206,17 +255,17 @@ impl KvStore {
         }
     }
 
-    fn append_wal(&mut self, cmd: &OnDiskCommand) -> Result<u64> {
-        let mut writer = BufWriter::new(&self.wal_log.fd);
-        let offset = self.wal_log.append(&mut writer, cmd)?;
+    fn append_cmd_wal(&mut self, cmd: &OnDiskCommand) -> Result<u64> {
+        let mut writer = BufWriter::new(&self.wal_cmd.fd);
+        let offset = self.wal_cmd.append(&mut writer, cmd)?;
         writer.flush()?;
         Ok(offset)
     }
 
     // FIXME: get rid of &mut since it's a read operation.
-    fn read_wal(&self, offset: u64) -> Result<OnDiskCommand> {
-        let mut reader = BufReader::new(&self.wal_log.fd);
-        Ok(self.wal_log.read(&mut reader, offset)?)
+    fn read_cmd_wal(&self, offset: u64) -> Result<OnDiskCommand> {
+        let mut reader = BufReader::new(&self.wal_cmd.fd);
+        Ok(self.wal_cmd.read(&mut reader, offset)?)
     }
 }
 
