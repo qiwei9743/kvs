@@ -138,8 +138,12 @@ impl KvStore {
         let wal_cmd_fd = OpenOptions::new().read(true).write(true).open(&wal_cmd_path)?;
         let wal_meta_fd = OpenOptions::new().read(true).write(true).open(&wal_meta_path)?;
 
-        let mut wal_cmd_reader = BufReader::new(&wal_cmd_fd);
-        let mut wal_meta_reader = BufReader::new(&wal_meta_fd);
+        let mut wal_cmd_reader = BufReader::new(wal_cmd_fd.try_clone()?);
+        let mut wal_meta_reader = BufReader::new(wal_meta_fd.try_clone()?);
+
+        let wal_cmd = wal::WalLog::<OnDiskCommand>::new(wal_cmd_fd);
+        let wal_meta = wal::WalLog::<OnDiskMeta>::new(wal_meta_fd.try_clone()?);
+        let mut wal_meta_writer = BufWriter::new(wal_meta_fd);
 
         let mut location_finder = HashMap::new();
 
@@ -154,10 +158,20 @@ impl KvStore {
         }
 
         wal_cmd_reader.seek(SeekFrom::Start(latest_cmd_pos))?;
+        wal_meta_writer.seek(SeekFrom::End(0))?;
+
+        let mut kvs = Self {
+            wal_cmd,
+            wal_meta,
+            wal_meta_writer,
+            latest_seq: 0,
+            location_finder: HashMap::new(),
+        };
 
         for (offset, OnDiskCommand{key, value}) in
-            wal::WalLog::<OnDiskCommand>::iter(&mut wal_cmd_reader) {
-                Self::fill_from_cmd(&mut location_finder, key, value, offset);
+            wal::WalLog::<OnDiskCommand>::iter(&mut wal_cmd_reader).skip(1) {
+                kvs.fill_from_cmd(&mut location_finder, key, value, offset)?;
+
         }
         latest_seq = std::cmp::max(
             location_finder.iter().map(|(_k, v)| v.0 ).max().unwrap_or(0),
@@ -172,18 +186,10 @@ impl KvStore {
             (k, v.1)
         }).collect();
 
-        let wal_cmd = wal::WalLog::<OnDiskCommand>::new(wal_cmd_fd);
-        let wal_meta = wal::WalLog::<OnDiskMeta>::new(wal_meta_fd.try_clone()?);
-        let wal_meta_writer = BufWriter::new(wal_meta_fd);
-        Ok (
-            Self {
-                wal_cmd,
-                wal_meta,
-                wal_meta_writer,
-                latest_seq,
-                location_finder,
-            }
-        )
+        kvs.latest_seq = latest_seq;
+        kvs.wal_meta_writer.flush()?;
+        kvs.location_finder = location_finder;
+        Ok (kvs)
     }
 
     fn fill_from_meta(map: &mut std::collections::HashMap<String, (u64, Value)>,
@@ -224,40 +230,72 @@ impl KvStore {
         }
     }
 
-    fn fill_from_cmd(map: &mut std::collections::HashMap<String, (u64, Value)>,
-                     key: String, value: OnDiskValue, offset: u64) {
+    fn fill_from_cmd(&mut self, map: &mut std::collections::HashMap<String, (u64, Value)>,
+                     key: String, value: OnDiskValue, offset: u64) -> Result<()> {
 
         match value {
             OnDiskValue::DeletedKey(sequence) => {
-                map.entry(key)
+                map.entry(key.clone())
                     .and_modify(| e: &mut(u64, Value) |{
                         if e.0 < sequence {
                             *e = (sequence, Value::Deleted);
                         }
                     })
                     .or_insert((sequence, Value::Deleted));
+
+                let pl = OnDiskMeta::CmdIndex (OnDiskCommand {
+                    key,
+                    value: OnDiskValue::DeletedKey(self.latest_seq),
+                });
+                self.append_meta_wal(&pl)?;
             },
-            OnDiskValue::Pointer(sequence, OnDiskPointer{offset, ..}) => {
-                map.entry(key)
+            OnDiskValue::Pointer(sequence, OnDiskPointer{offset: loffset, ..}) => {
+                map.entry(key.clone())
                     .and_modify(| e: &mut(u64, Value) |{
                         if e.0 < sequence {
-                            *e = (sequence, Value::Location(offset));
+                            *e = (sequence, Value::Location(loffset));
                         }
                     })
-                    .or_insert((sequence, Value::Location(offset)));
+                    .or_insert((sequence, Value::Location(loffset)));
+
+                let pl = OnDiskMeta::CmdIndex(
+                    OnDiskCommand {
+                        key,
+                        value: OnDiskValue::Pointer(
+                            sequence,
+                            OnDiskPointer {
+                                fid: 0, offset: loffset
+                            }
+                        )
+                    }
+                );
+                self.append_meta_wal(&pl)?;
             },
             OnDiskValue::Content(sequence, ..) => {
                 // key in cmd.wal may be long. To save memory,
                 // only keep lcoation
-                map.entry(key)
+                map.entry(key.clone())
                     .and_modify(| e: &mut(u64, Value)|{
                         if e.0 < sequence {
                             *e = (sequence, Value::Location(offset));
                         }
                     })
                     .or_insert((sequence, Value::Location(offset)));
+                let pl = OnDiskMeta::CmdIndex(
+                    OnDiskCommand {
+                        key,
+                        value: OnDiskValue::Pointer(
+                            sequence,
+                            OnDiskPointer {
+                                fid: 0, offset
+                            }
+                        )
+                    }
+                );
+                self.append_meta_wal(&pl)?;
             }
         }
+        Ok(())
     }
 
     /// get a value with a given key.
@@ -301,7 +339,7 @@ impl KvStore {
         let offset = self.append_cmd_wal(&cmd)?;
 
         let pl = OnDiskMeta::CmdIndex(
-            OnDiskCommand{
+            OnDiskCommand {
                 key: cmd.key,
                 value: OnDiskValue::Pointer(
                     self.latest_seq,
@@ -372,7 +410,7 @@ impl KvStore {
     }
 
     /// compaction reduntant data
-    pub fn compaction(&mut self) -> Result<u64> {
+    pub fn compact(&mut self) -> Result<u64> {
         unimplemented!()
     }
 }
