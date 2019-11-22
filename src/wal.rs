@@ -126,16 +126,16 @@ mod tests {
         }
         std::mem::drop(kvs);
 
-        let fd = File::open(tmpdir.into_path().join("wal.log")).unwrap();
-        let mut reader = BufReader::new(&fd);
-        let wi: WalIterator<OnDiskCommand, BufReader<&File>> = WalIterator::new(
+        let fd = File::open(tmpdir.into_path().join("cmd.wal")).unwrap();
+        let mut reader = BufReader::new(fd);
+        let wi: WalIterator<OnDiskCommand, BufReader<File>> = WalIterator::new(
             &mut reader).unwrap();
         let kvvec:Vec<_> = wi.collect();
         for (idx, (_, cmd)) in kvvec.iter().enumerate() {
             let key = format!("key{}", idx);
             let value = format!("value{}", idx);
             assert_eq!(key, cmd.key);
-            if let crate::OnDiskValue::Content(content) = &cmd.value {
+            if let crate::OnDiskValue::Content(_sequence, content) = &cmd.value {
                 assert_eq!(value, *content);
             } else {
                 panic!("assert fail");

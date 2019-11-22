@@ -7,6 +7,7 @@ pub enum KvsError {
     IoError(std::io::Error),
     SerdeError(serde_json::error::Error),
     FromUtf8Error(std::string::FromUtf8Error),
+    FoundPointerFromDataWal,
 }
 
 impl From<std::io::Error> for KvsError {
